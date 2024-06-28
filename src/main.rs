@@ -3,14 +3,24 @@ use async_openai::types::{
     ChatCompletionRequestUserMessageArgs, CompletionUsage, CreateChatCompletionRequestArgs,
 };
 use async_openai::Client;
+use ollama_rs::{
+    generation::chat::{request::ChatMessageRequest, ChatMessage},
+    Ollama,
+};
 use reqwest::Client as ReqClient;
 use serde::Deserialize;
 use std::io;
+
+enum LlmProvider {
+    OpenAI,
+    Ollama,
+}
 
 struct Config {
     pub model: String,
     pub verbose: bool,
     pub wiki_pages: u32,
+    pub llm_server: LlmProvider,
 }
 
 fn get_config_from_env() -> Config {
@@ -19,11 +29,17 @@ fn get_config_from_env() -> Config {
         model: "gpt-3.5-turbo".into(),
         verbose: false,
         wiki_pages: 1,
+        llm_server: LlmProvider::OpenAI,
     };
     if let Ok(val) = std::env::var("AI_MODEL") {
         match val.as_ref() {
             "gpt-4-turbo" | "gpt-3.5-turbo" | "gpt-4o" => {
                 c.model = val;
+                c.llm_server = LlmProvider::OpenAI;
+            }
+            "llama3" => {
+                c.model = val;
+                c.llm_server = LlmProvider::Ollama;
             }
             _ => {
                 eprintln!(
@@ -58,7 +74,7 @@ Only the following models are currently allowed:
 }
 
 fn greet() {
-    println!(
+    eprintln!(
         "This is WikiRag!
 
 I will answer your question using knowledge from Wikipedia. I will first
@@ -87,7 +103,7 @@ fn pretty_print_usage(config: &Config, usage: Option<CompletionUsage>) {
             ),
             _ => (0.0, 0.0),
         };
-        println!(
+        eprintln!(
             "Tokens in: {} (${:.6}), tokens out: {} (${:.6})",
             usage.prompt_tokens, in_costs, usage.completion_tokens, out_costs
         );
@@ -128,7 +144,7 @@ async fn get_keywords_from_chatgpt(
     }
 }
 
-async fn answer_question_with_wikipage(
+async fn answer_question_with_wikipage_openai(
     config: &Config,
     wikipage: &Vec<String>,
     question: &str,
@@ -175,6 +191,60 @@ async fn answer_question_with_wikipage(
     }
 }
 
+async fn get_keywords_from_ollama(
+    config: &Config,
+    question: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut ollama = Ollama::new_default_with_history(30);
+
+    let user_msg = ChatMessage::system("Extract exactly one keyword from the user's question for a Wikipedia lookup, respond with just the single keyword. ".to_string() + question);
+
+    let response = ollama
+        .send_chat_messages_with_history(
+            ChatMessageRequest::new(config.model.clone(), vec![user_msg]),
+            "default".to_string(),
+        )
+        .await?;
+
+    if let Some(msg) = response.message {
+        Ok(msg.content.clone())
+    } else {
+        Ok("Did not receive response!".to_string())
+    }
+}
+
+async fn answer_question_with_wikipage_ollama(
+    config: &Config,
+    wikipage: &Vec<String>,
+    question: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut ollama = Ollama::new_default_with_history(30);
+
+    let mut messages: String = "".to_string();
+    for w in wikipage.iter() {
+        messages.push_str(w);
+        messages.push_str("\n");
+    }
+    messages.push_str(&format!(
+        "Now answer the following question, using the information in the provided text: {}",
+        question
+    ));
+    let user_msg = ChatMessage::system(messages);
+
+    let response = ollama
+        .send_chat_messages_with_history(
+            ChatMessageRequest::new(config.model.clone(), vec![user_msg]),
+            "default".to_string(),
+        )
+        .await?;
+
+    if let Some(msg) = response.message {
+        Ok(msg.content.clone())
+    } else {
+        Ok("No response received".to_string())
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct SearchResult {
     title: String,
@@ -215,7 +285,7 @@ async fn search_wikipedia(
     let body = response.text().await?;
 
     if config.verbose {
-        println!("Raw response: {}", body);
+        eprintln!("Raw response: {}", body);
     }
 
     let response: WikipediaResponse = serde_json::from_str(&body)?;
@@ -267,7 +337,7 @@ async fn download_wikipedia_page(
     let body = response.text().await?;
 
     if config.verbose {
-        println!("Raw response: {}", body);
+        eprintln!("Raw response: {}", body);
     }
 
     let response: WikipediaExtractResponse = serde_json::from_str(&body)?;
@@ -282,7 +352,7 @@ async fn download_wikipedia_page(
 fn deal_with_error<T>(r: Result<T, Box<dyn std::error::Error>>, ec: i32) -> T {
     match r {
         Err(e) => {
-            eprintln!("Error: {}", e);
+            println!("Error: {}", e);
             std::process::exit(ec);
         }
         Ok(t) => t,
@@ -297,27 +367,30 @@ async fn main() {
 
     // Read question:
     let mut question = String::new();
-    println!("Please enter your question:");
+    eprintln!("Please enter your question:");
     io::stdin().read_line(&mut question).unwrap();
 
-    println!(
+    eprintln!(
         "\nPerforming keyword derivation using LLM model {}...",
         config.model
     );
-    let res = get_keywords_from_chatgpt(&config, &question.trim()).await;
+    let res = match config.llm_server {
+        LlmProvider::OpenAI => get_keywords_from_chatgpt(&config, &question.trim()).await,
+        LlmProvider::Ollama => get_keywords_from_ollama(&config, &question.trim()).await,
+    };
     let keywords: String = deal_with_error(res, 1);
-    println!("Keywords found: {}", keywords);
+    eprintln!("Keywords found: {}", keywords);
 
-    println!("\nPerforming lookup in Wikipedia using '{}'...", keywords);
+    eprintln!("\nPerforming lookup in Wikipedia using '{}'...", keywords);
     let res = search_wikipedia(&config, &keywords).await;
     let pages = deal_with_error(res, 2);
-    println!("Wikipedia search results:");
-    println!("  page id | title");
-    println!("==========|===============================");
+    eprintln!("Wikipedia search results:");
+    eprintln!("  page id | title");
+    eprintln!("==========|===============================");
     for p in pages.iter() {
-        println!("{:>10}| {}", p.page_id, p.title);
+        eprintln!("{:>10}| {}", p.page_id, p.title);
     }
-    println!("");
+    eprintln!("");
 
     // Download pages:
     let mut page_strings: Vec<String> = vec![];
@@ -327,7 +400,7 @@ async fn main() {
         }
         let res = download_wikipedia_page(&config, &pages[i].page_id).await;
         let page = deal_with_error(res, 3);
-        println!(
+        eprintln!(
             "Wikipedia page downloaded '{}': Size: {}",
             pages[i].title,
             page.len(),
@@ -335,8 +408,16 @@ async fn main() {
         page_strings.push(page);
     }
 
-    println!("\nAnswering question using Wikipedia pages and LLM model...");
-    let res = answer_question_with_wikipage(&config, &page_strings, &question).await;
+    eprintln!("\nAnswering question using Wikipedia pages and LLM model...");
+    let res = match config.llm_server {
+        LlmProvider::OpenAI => {
+            answer_question_with_wikipage_openai(&config, &page_strings, &question).await
+        }
+        LlmProvider::Ollama => {
+            answer_question_with_wikipage_ollama(&config, &page_strings, &question).await
+        }
+    };
     let answer = deal_with_error(res, 4);
-    println!("\nAnswer:\n{}", answer);
+    eprintln!("\nAnswer:");
+    println!("{}", answer);
 }
