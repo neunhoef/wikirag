@@ -1,6 +1,6 @@
 use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs, CompletionUsage,
-    CreateChatCompletionRequestArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestUserMessageArgs, CompletionUsage, CreateChatCompletionRequestArgs,
 };
 use async_openai::Client;
 use reqwest::Client as ReqClient;
@@ -10,6 +10,7 @@ use std::io;
 struct Config {
     pub model: String,
     pub verbose: bool,
+    pub wiki_pages: u32,
 }
 
 fn get_config_from_env() -> Config {
@@ -17,6 +18,7 @@ fn get_config_from_env() -> Config {
     let mut c = Config {
         model: "gpt-3.5-turbo".into(),
         verbose: false,
+        wiki_pages: 1,
     };
     if let Ok(val) = std::env::var("AI_MODEL") {
         match val.as_ref() {
@@ -25,7 +27,12 @@ fn get_config_from_env() -> Config {
             }
             _ => {
                 eprintln!(
-                    "Unknown model {} requested, falling back to 'gpt-3.5-tuirbo'.\n",
+                    "Unknown model {} requested, falling back to 'gpt-3.5-turbo'.
+Only the following models are currently allowed:
+  - gpt-4-turbo
+  - gpt-4o
+  - gpt-3.5-turbo
+",
                     val
                 );
             }
@@ -34,6 +41,17 @@ fn get_config_from_env() -> Config {
     if let Ok(val) = std::env::var("VERBOSE") {
         if !val.is_empty() {
             c.verbose = true;
+        }
+    }
+    if let Ok(val) = std::env::var("WIKI_PAGES") {
+        if !val.is_empty() {
+            let n = val.parse::<u32>();
+            if let Ok(n) = n {
+                c.wiki_pages = n;
+                if c.wiki_pages == 0 {
+                    c.wiki_pages = 1;
+                }
+            }
         }
     }
     c
@@ -70,7 +88,7 @@ fn pretty_print_usage(config: &Config, usage: Option<CompletionUsage>) {
             _ => (0.0, 0.0),
         };
         println!(
-            "Tokens in: {} (${:10.6e}, tokens out: {} (${:10.6e})",
+            "Tokens in: {} (${:.6}), tokens out: {} (${:.6})",
             usage.prompt_tokens, in_costs, usage.completion_tokens, out_costs
         );
     }
@@ -112,25 +130,34 @@ async fn get_keywords_from_chatgpt(
 
 async fn answer_question_with_wikipage(
     config: &Config,
-    wikipage: &str,
+    wikipage: &Vec<String>,
     question: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let client = Client::new();
 
-    let request = CreateChatCompletionRequestArgs::default()
-        .max_tokens(200_u32)
-        .model("gpt-4o")
-        .messages([
+    let mut messages: Vec<ChatCompletionRequestMessage> = vec![];
+    for w in wikipage.iter() {
+        messages.push(
             ChatCompletionRequestSystemMessageArgs::default()
-                .content(format!("Take this text: {}", wikipage))
-                .name("Wikipedia".to_string()).build()?.into(),
-            ChatCompletionRequestUserMessageArgs::default()
-                .content(format!(
-                        "Now answer the following question, using the information in the provided text: {}",
-                        question
-                    ))
-                .build()?.into(),
-        ])
+                .content(w)
+                .name("Wikipedia".to_string())
+                .build()?
+                .into(),
+        );
+    }
+    messages.push(
+        ChatCompletionRequestUserMessageArgs::default()
+            .content(format!(
+                "Now answer the following question, using the information in the provided text: {}",
+                question
+            ))
+            .build()?
+            .into(),
+    );
+    let request = CreateChatCompletionRequestArgs::default()
+        .max_tokens(1000_u32)
+        .model(&config.model)
+        .messages(messages)
         .build()?;
 
     let response = client.chat().create(request).await?;
@@ -221,7 +248,10 @@ struct WikipediaExtractResponse {
     query: QueryPages,
 }
 
-async fn download_wikipedia_page(page_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn download_wikipedia_page(
+    config: &Config,
+    page_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     let client = ReqClient::new();
     let base_url = "https://en.wikipedia.org/w/api.php";
 
@@ -236,7 +266,9 @@ async fn download_wikipedia_page(page_id: &str) -> Result<String, Box<dyn std::e
     let response = client.get(base_url).query(&params).send().await?;
     let body = response.text().await?;
 
-    //println!("Raw response: {}", body);
+    if config.verbose {
+        println!("Raw response: {}", body);
+    }
 
     let response: WikipediaExtractResponse = serde_json::from_str(&body)?;
 
@@ -287,25 +319,24 @@ async fn main() {
     }
     println!("");
 
-    // Download first page:
-    let page = download_wikipedia_page(&pages[0].page_id).await;
-    let p = match page {
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(3);
+    // Download pages:
+    let mut page_strings: Vec<String> = vec![];
+    for i in 0..config.wiki_pages as usize {
+        if i >= pages.len() {
+            break;
         }
-        Ok(p) => p,
-    };
-
-    println!("Wikipedia page downloaded:\nSize: {}\n", p.len());
-    let answer = answer_question_with_wikipage(&config, &p, &question).await;
-    match answer {
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(4);
-        }
-        Ok(a) => {
-            println!("Answer: {}", a);
-        }
+        let res = download_wikipedia_page(&config, &pages[i].page_id).await;
+        let page = deal_with_error(res, 3);
+        println!(
+            "Wikipedia page downloaded '{}': Size: {}",
+            pages[i].title,
+            page.len(),
+        );
+        page_strings.push(page);
     }
+
+    println!("\nAnswering question using Wikipedia pages and LLM model...");
+    let res = answer_question_with_wikipage(&config, &page_strings, &question).await;
+    let answer = deal_with_error(res, 4);
+    println!("\nAnswer:\n{}", answer);
 }
