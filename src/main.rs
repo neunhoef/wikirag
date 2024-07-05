@@ -385,10 +385,15 @@ async fn main() {
     let res = search_wikipedia(&config, &keywords).await;
     let pages = deal_with_error(res, 2);
     eprintln!("Wikipedia search results:");
-    eprintln!("  page id | title");
-    eprintln!("==========|===============================");
+    eprintln!("  page id | title                | URL");
+    eprintln!("==========|======================|========");
     for p in pages.iter() {
-        eprintln!("{:>10}| {}", p.page_id, p.title);
+        eprintln!(
+            "{:>10}| {:<30} | https://en.wikipedia.org/wiki/{}",
+            p.page_id,
+            p.title,
+            p.title.replace(" ", "_"),
+        );
     }
     eprintln!("");
 
@@ -418,6 +423,12 @@ async fn main() {
         }
     };
     let answer = deal_with_error(res, 4);
-    eprintln!("\nAnswer:");
-    println!("{}", answer);
+    eprintln!("\n");
+    println!("{} \n\n***Links***:", answer);
+    for p in pages.iter() {
+        println!(
+            "https://en.wikipedia.org/wiki/{}",
+            p.title.replace(" ", "_")
+        );
+    }
 }
