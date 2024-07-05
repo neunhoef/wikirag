@@ -1,0 +1,3 @@
+ - Limit input size by truncating wikipedia page.
+ - Make 100 test questions.
+ - Just use comma-separated list of up to t search terms.
